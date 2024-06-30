@@ -52,6 +52,8 @@ class PurchaseInvoiceItem(Document):
 		manufacturer_part_no: DF.Data | None
 		margin_rate_or_amount: DF.Float
 		margin_type: DF.Literal["", "Percentage", "Amount"]
+		material_request: DF.Link | None
+		material_request_item: DF.Data | None
 		net_amount: DF.Currency
 		net_rate: DF.Currency
 		page_break: DF.Check
@@ -88,6 +90,7 @@ class PurchaseInvoiceItem(Document):
 		stock_uom_rate: DF.Currency
 		total_weight: DF.Float
 		uom: DF.Link
+		use_serial_batch_fields: DF.Check
 		valuation_rate: DF.Currency
 		warehouse: DF.Link | None
 		weight_per_unit: DF.Float
