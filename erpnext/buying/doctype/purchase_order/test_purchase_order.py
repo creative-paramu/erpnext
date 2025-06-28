@@ -5,7 +5,7 @@
 import json
 
 import frappe
-from frappe.tests import IntegrationTestCase, UnitTestCase
+from frappe.tests import IntegrationTestCase, change_settings
 from frappe.utils import add_days, flt, getdate, nowdate
 from frappe.utils.data import today
 
@@ -26,15 +26,6 @@ from erpnext.stock.doctype.material_request.test_material_request import make_ma
 from erpnext.stock.doctype.purchase_receipt.purchase_receipt import (
 	make_purchase_invoice as make_pi_from_pr,
 )
-
-
-class UnitTestPurchaseOrder(UnitTestCase):
-	"""
-	Unit tests for PurchaseOrder.
-	Use this class for testing individual functions and methods.
-	"""
-
-	pass
 
 
 class TestPurchaseOrder(IntegrationTestCase):
@@ -60,6 +51,13 @@ class TestPurchaseOrder(IntegrationTestCase):
 		po.items[1].qty = 1
 		po.save()
 		self.assertEqual(po.items[1].qty, 1)
+
+	def test_purchase_order_zero_qty(self):
+		po = create_purchase_order(qty=0, do_not_save=True)
+
+		with change_settings("Buying Settings", {"allow_zero_qty_in_purchase_order": 1}):
+			po.save()
+			self.assertEqual(po.items[0].qty, 0)
 
 	def test_make_purchase_receipt(self):
 		po = create_purchase_order(do_not_submit=True)
@@ -297,22 +295,21 @@ class TestPurchaseOrder(IntegrationTestCase):
 		user = "test@example.com"
 		test_user = frappe.get_doc("User", user)
 		test_user.add_roles("Accounts User")
-		frappe.set_user(user)
 
-		# update qty
-		trans_item = json.dumps(
-			[{"item_code": "_Test Item", "rate": 200, "qty": 7, "docname": po.items[0].name}]
-		)
-		self.assertRaises(
-			frappe.ValidationError, update_child_qty_rate, "Purchase Order", trans_item, po.name
-		)
+		with self.set_user(user):
+			# update qty
+			trans_item = json.dumps(
+				[{"item_code": "_Test Item", "rate": 200, "qty": 7, "docname": po.items[0].name}]
+			)
+			self.assertRaises(
+				frappe.ValidationError, update_child_qty_rate, "Purchase Order", trans_item, po.name
+			)
 
-		# add new item
-		trans_item = json.dumps([{"item_code": "_Test Item", "rate": 100, "qty": 2}])
-		self.assertRaises(
-			frappe.ValidationError, update_child_qty_rate, "Purchase Order", trans_item, po.name
-		)
-		frappe.set_user("Administrator")
+			# add new item
+			trans_item = json.dumps([{"item_code": "_Test Item", "rate": 100, "qty": 2}])
+			self.assertRaises(
+				frappe.ValidationError, update_child_qty_rate, "Purchase Order", trans_item, po.name
+			)
 
 	def test_update_child_with_tax_template(self):
 		"""
@@ -941,6 +938,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		automatically_fetch_payment_terms(enable=0)
 
 	def test_internal_transfer_flow(self):
+		from erpnext.accounts.doctype.cost_center.test_cost_center import create_cost_center
 		from erpnext.accounts.doctype.sales_invoice.sales_invoice import (
 			make_inter_company_purchase_invoice,
 		)
@@ -956,8 +954,16 @@ class TestPurchaseOrder(IntegrationTestCase):
 		prepare_data_for_internal_transfer()
 		supplier = "_Test Internal Supplier 2"
 
+		create_cost_center(
+			cost_center_name="_Test Cost Center for perpetual inventory Account",
+			company="_Test Company with perpetual inventory",
+		)
+
 		mr = make_material_request(
-			qty=2, company="_Test Company with perpetual inventory", warehouse="Stores - TCP1"
+			qty=2,
+			company="_Test Company with perpetual inventory",
+			warehouse="Stores - TCP1",
+			cost_center="_Test Cost Center for perpetual inventory Account - TCP1",
 		)
 
 		po = create_purchase_order(
@@ -1097,9 +1103,9 @@ class TestPurchaseOrder(IntegrationTestCase):
 
 		# Test - 2: Subcontracted Quantity for the PO Items of each line item should be updated accordingly
 		po.reload()
-		self.assertEqual(po.items[0].sco_qty, 5)
-		self.assertEqual(po.items[1].sco_qty, 0)
-		self.assertEqual(po.items[2].sco_qty, 12.5)
+		self.assertEqual(po.items[0].subcontracted_quantity, 5)
+		self.assertEqual(po.items[1].subcontracted_quantity, 0)
+		self.assertEqual(po.items[2].subcontracted_quantity, 12.5)
 
 		# Test - 3: Amount for both FG Item and its Service Item should be updated correctly based on change in Quantity
 		self.assertEqual(sco.items[0].amount, 2000)
@@ -1135,10 +1141,10 @@ class TestPurchaseOrder(IntegrationTestCase):
 
 		# Test - 8: Subcontracted Quantity for each PO Item should be subtracted if SCO gets cancelled
 		po.reload()
-		self.assertEqual(po.items[2].sco_qty, 25)
+		self.assertEqual(po.items[2].subcontracted_quantity, 25)
 		sco.cancel()
 		po.reload()
-		self.assertEqual(po.items[2].sco_qty, 12.5)
+		self.assertEqual(po.items[2].subcontracted_quantity, 12.5)
 
 		sco = make_subcontracting_order(po.name)
 		sco.save()
@@ -1238,6 +1244,80 @@ class TestPurchaseOrder(IntegrationTestCase):
 		# Check if the billed amount stayed the same
 		po.reload()
 		self.assertEqual(po.per_billed, 100)
+
+	@IntegrationTestCase.change_settings("Buying Settings", {"allow_zero_qty_in_purchase_order": 1})
+	def test_receive_zero_qty_purchase_order(self):
+		"""
+		Test the flow of a Unit Price PO and PR creation against it until completion.
+		Flow:
+		PO Qty 0 -> Receive +5 -> Receive +5 -> Update PO Qty +10 -> PO is 100% received
+		"""
+		po = create_purchase_order(qty=0)
+		pr = make_purchase_receipt(po.name)
+
+		self.assertEqual(pr.items[0].qty, 0)
+		pr.items[0].qty = 5
+		pr.submit()
+
+		po.reload()
+		self.assertEqual(po.items[0].received_qty, 5)
+		self.assertFalse(po.per_received)
+		self.assertEqual(po.status, "To Receive and Bill")
+
+		# Update PO Item Qty to 10 after receipt of items
+		first_item_of_po = po.items[0]
+		trans_item = json.dumps(
+			[
+				{
+					"item_code": first_item_of_po.item_code,
+					"rate": first_item_of_po.rate,
+					"qty": 10,
+					"docname": first_item_of_po.name,
+				}
+			]
+		)
+		update_child_qty_rate("Purchase Order", trans_item, po.name)
+
+		# Test: PR can be made against PO as long PO qty is 0 OR PO qty > received qty
+		pr2 = make_purchase_receipt(po.name)
+
+		po.reload()
+		self.assertEqual(po.items[0].qty, 10)
+		self.assertEqual(pr2.items[0].qty, 5)
+
+		pr2.submit()
+
+		# PO should be updated to 100% received
+		po.reload()
+		self.assertEqual(po.items[0].qty, 10)
+		self.assertEqual(po.items[0].received_qty, 10)
+		self.assertEqual(po.per_received, 100.0)
+		self.assertEqual(po.status, "To Bill")
+
+	@IntegrationTestCase.change_settings("Buying Settings", {"allow_zero_qty_in_purchase_order": 1})
+	def test_bill_zero_qty_purchase_order(self):
+		po = create_purchase_order(qty=0)
+
+		self.assertEqual(po.grand_total, 0)
+		self.assertFalse(po.per_billed)
+		self.assertEqual(po.items[0].qty, 0)
+		self.assertEqual(po.items[0].rate, 500)
+
+		pi = make_pi_from_po(po.name)
+		self.assertEqual(pi.items[0].qty, 0)
+		self.assertEqual(pi.items[0].rate, 500)
+
+		pi.items[0].qty = 5
+		pi.submit()
+
+		self.assertEqual(pi.grand_total, 2500)
+
+		po.reload()
+		self.assertEqual(po.items[0].amount, 0)
+		self.assertEqual(po.items[0].billed_amt, 2500)
+		# PO still has qty 0, so billed % should be unset
+		self.assertFalse(po.per_billed)
+		self.assertEqual(po.status, "To Receive and Bill")
 
 
 def create_po_for_sc_testing():

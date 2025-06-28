@@ -6,6 +6,7 @@ import frappe
 from frappe import _
 from frappe.model.meta import get_field_precision
 from frappe.utils import cstr, flt
+from frappe.utils.nestedset import get_descendants_of
 from frappe.utils.xlsxutils import handle_html
 from pypika import Order
 
@@ -319,7 +320,7 @@ def get_columns(additional_table_columns, filters):
 			"width": 100,
 		},
 		{
-			"label": _("Tax Rate"),
+			"label": _("Rate"),
 			"fieldname": "rate",
 			"fieldtype": "Float",
 			"options": "currency",
@@ -376,7 +377,12 @@ def apply_conditions(query, si, sii, filters, additional_conditions=None):
 		query = query.where(sii.item_code == filters.get("item_code"))
 
 	if filters.get("item_group"):
-		query = query.where(sii.item_group == filters.get("item_group"))
+		if frappe.db.get_value("Item Group", filters.get("item_group"), "is_group"):
+			item_groups = get_descendants_of("Item Group", filters.get("item_group"))
+			item_groups.append(filters.get("item_group"))
+			query = query.where(sii.item_group.isin(item_groups))
+		else:
+			query = query.where(sii.item_group == filters.get("item_group"))
 
 	if filters.get("income_account"):
 		query = query.where(
@@ -385,27 +391,24 @@ def apply_conditions(query, si, sii, filters, additional_conditions=None):
 			| (si.unrealized_profit_loss_account == filters.get("income_account"))
 		)
 
-	if not filters.get("group_by"):
-		query = query.orderby(si.posting_date, order=Order.desc)
-		query = query.orderby(sii.item_group, order=Order.desc)
-	else:
-		query = apply_group_by_conditions(query, si, sii, filters)
-
 	for key, value in (additional_conditions or {}).items():
 		query = query.where(si[key] == value)
 
 	return query
 
 
-def apply_group_by_conditions(query, si, ii, filters):
-	if filters.get("group_by") == "Invoice":
-		query = query.orderby(ii.parent, order=Order.desc)
+def apply_order_by_conditions(query, si, ii, filters):
+	if not filters.get("group_by"):
+		query += f" order by {si.posting_date} desc, {ii.item_group} desc"
+	elif filters.get("group_by") == "Invoice":
+		query += f" order by {ii.parent} desc"
 	elif filters.get("group_by") == "Item":
-		query = query.orderby(ii.item_code)
+		query += f" order by {ii.item_code}"
 	elif filters.get("group_by") == "Item Group":
-		query = query.orderby(ii.item_group)
+		query += f" order by {ii.item_group}"
 	elif filters.get("group_by") in ("Customer", "Customer Group", "Territory", "Supplier"):
-		query = query.orderby(si[frappe.scrub(filters.get("group_by"))])
+		filter_field = frappe.scrub(filters.get("group_by"))
+		query += f" order by {filter_field} desc"
 
 	return query
 
@@ -480,7 +483,17 @@ def get_items(filters, additional_query_columns, additional_conditions=None):
 
 	query = apply_conditions(query, si, sii, filters, additional_conditions)
 
-	return query.run(as_dict=True)
+	from frappe.desk.reportview import build_match_conditions
+
+	query, params = query.walk()
+	match_conditions = build_match_conditions("Sales Invoice")
+
+	if match_conditions:
+		query += " and " + match_conditions
+
+	query = apply_order_by_conditions(query, si, sii, filters)
+
+	return frappe.db.sql(query, params, as_dict=True)
 
 
 def get_delivery_notes_against_sales_order(item_list):
@@ -512,7 +525,7 @@ def get_grand_total(filters, doctype):
 				"docstatus": 1,
 				"posting_date": ("between", [filters.get("from_date"), filters.get("to_date")]),
 			},
-			"sum(base_grand_total)",
+			[{"SUM": "base_grand_total"}],
 		)
 	)
 

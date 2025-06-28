@@ -38,8 +38,13 @@ erpnext.PointOfSale.ItemSelector = class {
 
 	async load_items_data() {
 		if (!this.item_group) {
-			const res = await frappe.db.get_value("Item Group", { lft: 1, is_group: 1 }, "name");
-			this.parent_item_group = res.message.name;
+			frappe.call({
+				method: "erpnext.selling.page.point_of_sale.point_of_sale.get_parent_item_group",
+				async: false,
+				callback: (r) => {
+					if (r.message) this.parent_item_group = r.message;
+				},
+			});
 		}
 		if (!this.price_list) {
 			const res = await frappe.db.get_value("POS Profile", this.pos_profile, "selling_price_list");
@@ -99,11 +104,11 @@ erpnext.PointOfSale.ItemSelector = class {
 				return `<div class="item-qty-pill">
 							<span class="indicator-pill whitespace-nowrap ${indicator_color}">${qty_to_display}</span>
 						</div>
-						<div class="flex items-center justify-center border-b-grey text-6xl text-grey-100" style="height:8rem; min-height:8rem">
+						<div class="item-display">
 							<img
 								onerror="cur_pos.item_selector.handle_broken_image(this)"
-								class="h-full item-img" src="${item_image}"
-								alt="${frappe.get_abbr(item.item_name)}"
+								class="item-img" src="${item_image}"
+								alt="${item.item_name}"
 							>
 						</div>`;
 			} else {
@@ -183,7 +188,7 @@ erpnext.PointOfSale.ItemSelector = class {
 
 	attach_clear_btn() {
 		this.search_field.$wrapper.find(".control-input").append(
-			`<span class="link-btn" style="top: 2px;">
+			`<span class="link-btn">
 				<a class="btn-open no-decoration" title="${__("Clear")}">
 					${frappe.utils.icon("close", "sm")}
 				</a>
@@ -328,13 +333,16 @@ erpnext.PointOfSale.ItemSelector = class {
 	}
 
 	filter_items({ search_term = "" } = {}) {
+		const selling_price_list = this.events.get_frm().doc.selling_price_list;
+
 		if (search_term) {
 			search_term = search_term.toLowerCase();
 
 			// memoize
 			this.search_index = this.search_index || {};
-			if (this.search_index[search_term]) {
-				const items = this.search_index[search_term];
+			this.search_index[selling_price_list] = this.search_index[selling_price_list] || {};
+			if (this.search_index[selling_price_list][search_term]) {
+				const items = this.search_index[selling_price_list][search_term];
 				this.items = items;
 				this.render_item_list(items);
 				this.auto_add_item && this.items.length == 1 && this.add_filtered_item_to_cart();
@@ -346,7 +354,7 @@ erpnext.PointOfSale.ItemSelector = class {
 			// eslint-disable-next-line no-unused-vars
 			const { items, serial_no, batch_no, barcode } = message;
 			if (search_term && !barcode) {
-				this.search_index[search_term] = items;
+				this.search_index[selling_price_list][search_term] = items;
 			}
 			this.items = items;
 			this.render_item_list(items);
