@@ -5,7 +5,7 @@
 import frappe
 from frappe.model.document import Document
 from frappe.query_builder import Case, Order
-from frappe.query_builder.functions import Coalesce, CombineDatetime, Sum
+from frappe.query_builder.functions import Coalesce, Sum
 from frappe.utils import flt
 
 
@@ -19,6 +19,7 @@ class Bin(Document):
 		from frappe.types import DF
 
 		actual_qty: DF.Float
+		company: DF.Link | None
 		indented_qty: DF.Float
 		item_code: DF.Link
 		ordered_qty: DF.Float
@@ -264,7 +265,7 @@ def update_qty(bin_name, args):
 	actual_qty = bin_details.actual_qty or 0.0
 
 	# actual qty is not up to date in case of backdated transaction
-	if future_sle_exists(args, allow_force_reposting=False):
+	if future_sle_exists(args):
 		actual_qty = get_actual_qty(args.get("item_code"), args.get("warehouse"))
 
 	ordered_qty = flt(bin_details.ordered_qty) + flt(args.get("ordered_qty"))

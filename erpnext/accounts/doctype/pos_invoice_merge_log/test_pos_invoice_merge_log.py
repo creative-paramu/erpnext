@@ -1,6 +1,5 @@
 # Copyright (c) 2020, Frappe Technologies Pvt. Ltd. and Contributors
 # See license.txt
-import json
 
 import frappe
 from frappe.tests import IntegrationTestCase
@@ -164,20 +163,36 @@ class TestPOSInvoiceMergeLog(IntegrationTestCase):
 		inv.load_from_db()
 
 		consolidated_invoice = frappe.get_doc("Sales Invoice", inv.consolidated_invoice)
-		item_wise_tax_detail = json.loads(consolidated_invoice.get("taxes")[0].item_wise_tax_detail)
-		expected_item_wise_tax_detail = {
-			"_Test Item": {
-				"tax_rate": 9,
-				"tax_amount": 9,
-				"net_amount": 100,
+
+		expected_item_wise_tax_details = [
+			{
+				"item_row": consolidated_invoice.items[0].name,
+				"tax_row": consolidated_invoice.taxes[0].name,
+				"rate": 9.0,
+				"amount": 9.0,
+				"taxable_amount": 100.0,
 			},
-			"_Test Item 2": {
-				"tax_rate": 5,
-				"tax_amount": 5,
-				"net_amount": 100,
+			{
+				"item_row": consolidated_invoice.items[1].name,
+				"tax_row": consolidated_invoice.taxes[0].name,
+				"rate": 5.0,
+				"amount": 5.0,
+				"taxable_amount": 100.0,
 			},
-		}
-		self.assertEqual(item_wise_tax_detail, expected_item_wise_tax_detail)
+		]
+
+		actual = [
+			{
+				"item_row": d.item_row,
+				"tax_row": d.tax_row,
+				"rate": d.rate,
+				"amount": d.amount,
+				"taxable_amount": d.taxable_amount,
+			}
+			for d in consolidated_invoice.get("item_wise_tax_details")
+		]
+
+		self.assertEqual(actual, expected_item_wise_tax_details)
 
 	def test_consolidation_round_off_error_1(self):
 		"""
@@ -491,3 +506,26 @@ class TestPOSInvoiceMergeLog(IntegrationTestCase):
 		self.assertTrue(frappe.db.exists("Sales Invoice", pos_inv3.consolidated_invoice))
 
 		self.assertTrue(pos_inv2.consolidated_invoice == pos_inv3.consolidated_invoice)
+
+	def test_company_in_pos_invoice_merge_log(self):
+		"""
+		Test if the company is fetched from POS Closing Entry
+		"""
+		test_user, pos_profile = init_user_and_profile()
+		opening_entry = create_opening_entry(pos_profile, test_user.name)
+
+		pos_inv = create_pos_invoice(rate=300, do_not_submit=1)
+		pos_inv.append("payments", {"mode_of_payment": "Cash", "account": "Cash - _TC", "amount": 300})
+		pos_inv.save()
+		pos_inv.submit()
+
+		closing_entry = make_closing_entry_from_opening(opening_entry)
+		closing_entry.insert()
+		closing_entry.submit()
+
+		self.assertTrue(frappe.db.exists("POS Invoice Merge Log", {"pos_closing_entry": closing_entry.name}))
+
+		pos_merge_log_company = frappe.db.get_value(
+			"POS Invoice Merge Log", {"pos_closing_entry": closing_entry.name}, "company"
+		)
+		self.assertEqual(pos_merge_log_company, closing_entry.company)

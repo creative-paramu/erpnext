@@ -30,7 +30,10 @@ frappe.ui.form.on("Material Request", {
 
 		frm.set_query("from_warehouse", "items", function (doc) {
 			return {
-				filters: { company: doc.company },
+				filters: {
+					company: doc.company,
+					is_group: 0,
+				},
 			};
 		});
 
@@ -39,6 +42,15 @@ frappe.ui.form.on("Material Request", {
 			return {
 				filters: {
 					item: row.item_code,
+				},
+			};
+		});
+
+		frm.set_query("buying_price_list", () => {
+			return {
+				filters: {
+					buying: 1,
+					enabled: 1,
 				},
 			};
 		});
@@ -61,27 +73,40 @@ frappe.ui.form.on("Material Request", {
 
 		frm.set_query("warehouse", "items", function (doc) {
 			return {
-				filters: { company: doc.company },
+				filters: {
+					company: doc.company,
+					is_group: 0,
+				},
 			};
 		});
 
 		frm.set_query("set_warehouse", function (doc) {
 			return {
-				filters: { company: doc.company },
+				filters: {
+					company: doc.company,
+					is_group: 0,
+				},
 			};
 		});
 
 		frm.set_query("set_from_warehouse", function (doc) {
 			return {
-				filters: { company: doc.company },
+				filters: {
+					company: doc.company,
+					is_group: 0,
+				},
 			};
 		});
 
 		erpnext.accounts.dimensions.setup_dimension_filters(frm, frm.doctype);
+		if (!frm.doc.buying_price_list) {
+			frm.doc.buying_price_list = frappe.defaults.get_default("buying_price_list");
+		}
 	},
 
 	company: function (frm) {
 		erpnext.accounts.dimensions.update_dimension(frm, frm.doctype);
+		erpnext.utils.set_letter_head(frm);
 	},
 
 	onload_post_render: function (frm) {
@@ -92,6 +117,7 @@ frappe.ui.form.on("Material Request", {
 		frm.events.make_custom_buttons(frm);
 		frm.toggle_reqd("customer", frm.doc.material_request_type == "Customer Provided");
 		prevent_past_schedule_dates(frm);
+		frm.trigger("set_warehouse_label");
 	},
 
 	transaction_date(frm) {
@@ -125,11 +151,13 @@ frappe.ui.form.on("Material Request", {
 
 			if (flt(frm.doc.per_ordered, precision) < 100) {
 				let add_create_pick_list_button = () => {
-					frm.add_custom_button(
-						__("Pick List"),
-						() => frm.events.create_pick_list(frm),
-						__("Create")
-					);
+					if (frm.doc.items.some((item) => item.stock_qty - item.picked_qty > 0)) {
+						frm.add_custom_button(
+							__("Pick List"),
+							() => frm.events.create_pick_list(frm),
+							__("Create")
+						);
+					}
 				};
 
 				if (frm.doc.material_request_type === "Material Transfer") {
@@ -259,7 +287,9 @@ frappe.ui.form.on("Material Request", {
 					from_warehouse: item.from_warehouse,
 					warehouse: item.warehouse,
 					doctype: frm.doc.doctype,
-					buying_price_list: frappe.defaults.get_default("buying_price_list"),
+					buying_price_list: frm.doc.buying_price_list
+						? frm.doc.buying_price_list
+						: frappe.defaults.get_default("buying_price_list"),
 					currency: frappe.defaults.get_default("Currency"),
 					name: frm.doc.name,
 					qty: item.qty || 1,
@@ -331,6 +361,9 @@ frappe.ui.form.on("Material Request", {
 					label: __("For Warehouse"),
 					options: "Warehouse",
 					reqd: 1,
+					get_query: function () {
+						return { filters: { company: frm.doc.company } };
+					},
 				},
 				{ fieldname: "qty", fieldtype: "Float", label: __("Quantity"), reqd: 1, default: 1 },
 				{
@@ -480,6 +513,7 @@ frappe.ui.form.on("Material Request", {
 			method: "erpnext.stock.doctype.material_request.material_request.raise_work_orders",
 			args: {
 				material_request: frm.doc.name,
+				company: frm.doc.company,
 			},
 			freeze: true,
 			callback: function (r) {
@@ -495,6 +529,23 @@ frappe.ui.form.on("Material Request", {
 		if (frm.doc.material_request_type !== "Material Transfer" && frm.doc.set_from_warehouse) {
 			frm.set_value("set_from_warehouse", "");
 		}
+
+		frm.trigger("set_warehouse_label");
+	},
+
+	set_warehouse_label(frm) {
+		let warehouse_label =
+			frm.doc.material_request_type === "Material Transfer" ? "Target Warehouse" : "Warehouse";
+		if (frm.doc.material_request_type === "Material Issue") {
+			warehouse_label = "From Warehouse";
+		}
+
+		frm.fields_dict["items"].grid.update_docfield_property("warehouse", "label", __(warehouse_label));
+
+		warehouse_label = "Set " + warehouse_label;
+		frm.set_df_property("set_warehouse", "label", __(warehouse_label));
+
+		refresh_field("items");
 	},
 });
 

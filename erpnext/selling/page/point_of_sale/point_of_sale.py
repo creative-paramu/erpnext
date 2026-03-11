@@ -5,6 +5,7 @@
 import json
 
 import frappe
+from frappe.query_builder import DocType, Order
 from frappe.utils import cint, get_datetime
 from frappe.utils.nestedset import get_root_of
 
@@ -55,7 +56,7 @@ def search_by_term(search_term, warehouse, price_list):
 				}
 			)
 
-	item_stock_qty, is_stock_item = get_stock_availability(item_code, warehouse)
+	item_stock_qty, is_stock_item, is_negative_stock_allowed = get_stock_availability(item_code, warehouse)
 	item_stock_qty = item_stock_qty // item.get("conversion_factor", 1)
 	item.update({"actual_qty": item_stock_qty})
 
@@ -121,15 +122,24 @@ def filter_result_items(result, pos_profile):
 
 
 @frappe.whitelist()
-def get_parent_item_group():
-	# Using get_all to ignore user permission
-	item_group = frappe.get_all("Item Group", {"lft": 1, "is_group": 1}, pluck="name")
-	if item_group:
-		return item_group[0]
+def get_parent_item_group(pos_profile: str):
+	item_groups = get_item_groups(pos_profile)
+
+	if not item_groups:
+		item_groups = frappe.get_all("Item Group", {"lft": 1, "is_group": 1}, pluck="name")
+
+	return item_groups[0] if item_groups else None
 
 
 @frappe.whitelist()
-def get_items(start, page_length, price_list, item_group, pos_profile, search_term=""):
+def get_items(
+	start: str | int,
+	page_length: str | int,
+	price_list: str | None,
+	item_group: str,
+	pos_profile: str,
+	search_term: str = "",
+):
 	warehouse, hide_unavailable_items = frappe.db.get_value(
 		"POS Profile", pos_profile, ["warehouse", "hide_unavailable_items"]
 	)
@@ -198,20 +208,26 @@ def get_items(start, page_length, price_list, item_group, pos_profile, search_te
 	current_date = frappe.utils.today()
 
 	for item in items_data:
-		item.actual_qty, _ = get_stock_availability(item.item_code, warehouse)
+		item.actual_qty, _, is_negative_stock_allowed = get_stock_availability(item.item_code, warehouse)
 
-		item_prices = frappe.get_all(
-			"Item Price",
-			fields=["price_list_rate", "currency", "uom", "batch_no", "valid_from", "valid_upto"],
-			filters={
-				"price_list": price_list,
-				"item_code": item.item_code,
-				"selling": True,
-				"valid_from": ["<=", current_date],
-				"valid_upto": ["in", [None, "", current_date]],
-			},
-			order_by="valid_from desc",
-		)
+		ItemPrice = DocType("Item Price")
+		item_prices = (
+			frappe.qb.from_(ItemPrice)
+			.select(
+				ItemPrice.price_list_rate,
+				ItemPrice.currency,
+				ItemPrice.uom,
+				ItemPrice.batch_no,
+				ItemPrice.valid_from,
+				ItemPrice.valid_upto,
+			)
+			.where(ItemPrice.price_list == price_list)
+			.where(ItemPrice.item_code == item.item_code)
+			.where(ItemPrice.selling == 1)
+			.where((ItemPrice.valid_from <= current_date) | (ItemPrice.valid_from.isnull()))
+			.where((ItemPrice.valid_upto >= current_date) | (ItemPrice.valid_upto.isnull()))
+			.orderby(ItemPrice.valid_from, order=Order.desc)
+		).run(as_dict=True)
 
 		stock_uom_price = next((d for d in item_prices if d.get("uom") == item.stock_uom), {})
 		item_uom = item.stock_uom
@@ -268,6 +284,8 @@ def add_search_fields_condition(search_term):
 	search_fields = frappe.get_all("POS Search Fields", fields=["fieldname"])
 	if search_fields:
 		for field in search_fields:
+			if not field.get("fieldname"):
+				continue
 			condition += " or item.`{}` like {}".format(
 				field["fieldname"], frappe.db.escape("%" + search_term + "%")
 			)
@@ -285,7 +303,7 @@ def get_item_group_condition(pos_profile):
 
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
-def item_group_query(doctype, txt, searchfield, start, page_len, filters):
+def item_group_query(doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict):
 	item_groups = []
 	cond = "1=1"
 	pos_profile = filters.get("pos_profile")
@@ -305,7 +323,7 @@ def item_group_query(doctype, txt, searchfield, start, page_len, filters):
 
 
 @frappe.whitelist()
-def check_opening_entry(user):
+def check_opening_entry(user: str):
 	open_vouchers = frappe.db.get_all(
 		"POS Opening Entry",
 		filters={"user": user, "pos_closing_entry": ["in", ["", None]], "docstatus": 1},
@@ -317,7 +335,7 @@ def check_opening_entry(user):
 
 
 @frappe.whitelist()
-def create_opening_voucher(pos_profile, company, balance_details):
+def create_opening_voucher(pos_profile: str, company: str, balance_details: str):
 	balance_details = json.loads(balance_details)
 
 	new_pos_opening = frappe.get_doc(
@@ -337,17 +355,22 @@ def create_opening_voucher(pos_profile, company, balance_details):
 
 
 @frappe.whitelist()
-def get_past_order_list(search_term, status, limit=20):
-	fields = ["name", "grand_total", "currency", "customer", "posting_time", "posting_date"]
+def get_past_order_list(search_term: str, status: str, limit: int = 20):
+	fields = ["name", "grand_total", "currency", "customer", "customer_name", "posting_time", "posting_date"]
 	invoice_list = []
 
 	if search_term and status:
 		pos_invoices_by_customer = frappe.db.get_list(
 			"POS Invoice",
-			filters=get_invoice_filters("POS Invoice", status, customer=search_term),
+			filters=get_invoice_filters("POS Invoice", status),
+			or_filters={
+				"customer_name": ["like", f"%{search_term}%"],
+				"customer": ["like", f"%{search_term}%"],
+			},
 			fields=fields,
 			page_length=limit,
 		)
+
 		pos_invoices_by_name = frappe.db.get_list(
 			"POS Invoice",
 			filters=get_invoice_filters("POS Invoice", status, name=search_term),
@@ -361,7 +384,11 @@ def get_past_order_list(search_term, status, limit=20):
 
 		sales_invoices_by_customer = frappe.db.get_list(
 			"Sales Invoice",
-			filters=get_invoice_filters("Sales Invoice", status, customer=search_term),
+			filters=get_invoice_filters("Sales Invoice", status),
+			or_filters={
+				"customer_name": ["like", f"%{search_term}%"],
+				"customer": ["like", f"%{search_term}%"],
+			},
 			fields=fields,
 			page_length=limit,
 		)
@@ -399,7 +426,7 @@ def get_past_order_list(search_term, status, limit=20):
 
 
 @frappe.whitelist()
-def set_customer_info(fieldname, customer, value=""):
+def set_customer_info(fieldname: str, customer: str, value: str = ""):
 	if fieldname == "loyalty_program":
 		frappe.db.set_value("Customer", customer, "loyalty_program", value)
 
@@ -439,7 +466,7 @@ def set_customer_info(fieldname, customer, value=""):
 
 
 @frappe.whitelist()
-def get_pos_profile_data(pos_profile):
+def get_pos_profile_data(pos_profile: str):
 	pos_profile = frappe.get_doc("POS Profile", pos_profile)
 	pos_profile = pos_profile.as_dict()
 
@@ -467,14 +494,11 @@ def order_results_by_posting_date(results):
 	)
 
 
-def get_invoice_filters(doctype, status, name=None, customer=None):
+def get_invoice_filters(doctype, status, name=None):
 	filters = {}
 
 	if name:
 		filters["name"] = ["like", f"%{name}%"]
-	if customer:
-		filters["customer"] = ["like", f"%{customer}%"]
-
 	if doctype == "POS Invoice":
 		filters["status"] = status
 		if status == "Partly Paid":
@@ -504,7 +528,7 @@ def get_invoice_filters(doctype, status, name=None, customer=None):
 
 
 @frappe.whitelist()
-def get_customer_recent_transactions(customer):
+def get_customer_recent_transactions(customer: str):
 	sales_invoices = frappe.db.get_list(
 		"Sales Invoice",
 		filters={

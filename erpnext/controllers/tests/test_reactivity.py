@@ -1,9 +1,8 @@
 import frappe
 from frappe import qb
 from frappe.tests import IntegrationTestCase
-from frappe.utils import getdate, today
+from frappe.utils import today
 
-from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import disable_dimension
 from erpnext.accounts.test.accounts_mixin import AccountsTestMixin
 
 
@@ -50,6 +49,7 @@ class TestReactivity(AccountsTestMixin, IntegrationTestCase):
 				"debit_to": self.debit_to,
 				"posting_date": today(),
 				"cost_center": self.cost_center,
+				"currency": "INR",
 				"conversion_rate": 1,
 				"selling_price_list": self.price_list,
 			}

@@ -4,7 +4,7 @@
 import frappe
 from frappe import _
 from frappe.utils import add_days, flt, get_datetime_str, nowdate
-from frappe.utils.data import getdate, now_datetime
+from frappe.utils.data import DateTimeLikeObject, now_datetime
 from frappe.utils.nestedset import get_root_of
 
 from erpnext import get_default_company
@@ -92,7 +92,12 @@ def get_pegged_rate(pegged_map, from_currency, to_currency, transaction_date=Non
 
 
 @frappe.whitelist()
-def get_exchange_rate(from_currency, to_currency, transaction_date=None, args=None):
+def get_exchange_rate(
+	from_currency: str,
+	to_currency: str,
+	transaction_date: DateTimeLikeObject | None = None,
+	args: str | None = None,
+):
 	if not (from_currency and to_currency):
 		# manqala 19/09/2016: Should this be an empty return or should it throw and exception?
 		return
@@ -102,7 +107,7 @@ def get_exchange_rate(from_currency, to_currency, transaction_date=None, args=No
 	if not transaction_date:
 		transaction_date = nowdate()
 
-	currency_settings = frappe.get_doc("Accounts Settings").as_dict()
+	currency_settings = frappe.get_cached_doc("Accounts Settings")
 	allow_stale_rates = currency_settings.get("allow_stale")
 
 	filters = [
@@ -202,7 +207,7 @@ def enable_all_roles_and_domains():
 def _enable_all_roles_for_admin():
 	from frappe.desk.page.setup_wizard.setup_wizard import add_all_roles_to
 
-	all_roles = set(frappe.db.get_values("Role", pluck="name"))
+	all_roles = set(frappe.get_all("Role", pluck="name"))
 	admin_roles = set(
 		frappe.db.get_values("Has Role", {"parent": "Administrator"}, fieldname="role", pluck="role")
 	)
@@ -221,6 +226,8 @@ def set_defaults_for_tests():
 		frappe.db.set_default(key, value)
 	frappe.db.set_single_value("Stock Settings", "auto_insert_price_list_rate_if_missing", 0)
 
+	frappe.db.set_single_value("Stock Settings", "enable_serial_and_batch_no_for_item", 1)
+
 
 def insert_record(records):
 	from frappe.desk.page.setup_wizard.setup_wizard import make_records
@@ -232,3 +239,15 @@ def welcome_email():
 	site_name = get_default_company() or "ERPNext"
 	title = _("Welcome to {0}").format(site_name)
 	return title
+
+
+def identity(x, *args, **kwargs):
+	"""Used for redefining the translation function to return the string as is.
+
+	We want to create english records but still mark the strings as translatable.
+	E.g. when the respective DocTypes have 'Translate Link Fields' enabled or
+	we're creating custom fields.
+
+	Use like this: `from erpnext.setup.utils import identity as _`
+	"""
+	return x

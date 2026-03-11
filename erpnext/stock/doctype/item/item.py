@@ -1,12 +1,11 @@
 # Copyright (c) 2021, Frappe Technologies Pvt. Ltd. and Contributors
 # License: GNU General Public License v3. See license.txt
 
-import copy
-import json
 
 import frappe
 from frappe import _, bold
 from frappe.model.document import Document
+from frappe.model.naming import NamingSeries
 from frappe.query_builder import Interval
 from frappe.query_builder.functions import Count, CurDate, UnixTimestamp
 from frappe.utils import (
@@ -19,7 +18,6 @@ from frappe.utils import (
 	now_datetime,
 	nowtime,
 	strip,
-	strip_html,
 )
 from frappe.utils.html_utils import clean_html
 from pypika import Order
@@ -127,11 +125,14 @@ class Item(Document):
 		opening_stock: DF.Float
 		over_billing_allowance: DF.Float
 		over_delivery_receipt_allowance: DF.Float
+		production_capacity: DF.Int
+		purchase_tax_withholding_category: DF.Link | None
 		purchase_uom: DF.Link | None
 		quality_inspection_template: DF.Link | None
 		reorder_levels: DF.Table[ItemReorder]
 		retain_sample: DF.Check
 		safety_stock: DF.Float
+		sales_tax_withholding_category: DF.Link | None
 		sales_uom: DF.Link | None
 		sample_quantity: DF.Int
 		serial_no_series: DF.Data | None
@@ -155,6 +156,7 @@ class Item(Document):
 		self.set_onload("stock_exists", self.stock_ledger_created())
 		self.set_onload("asset_naming_series", get_asset_naming_series())
 		self.set_onload("current_valuation_method", get_valuation_method(self.name))
+		self.set_onload("asset_exists", self.has_submitted_assets())
 
 	def autoname(self):
 		if frappe.db.get_default("item_naming_by") == "Naming Series":
@@ -178,14 +180,27 @@ class Item(Document):
 				self.add_price(default.default_price_list)
 
 		if self.opening_stock:
-			self.set_opening_stock()
+			if self.opening_stock > 10000 and self.has_serial_no:
+				frappe.enqueue(
+					self.set_opening_stock,
+					queue="long",
+					timeout=600,
+					job_name=f"set_opening_stock_for_{self.name}",
+				)
+				frappe.msgprint(
+					_(
+						"Opening stock creation has been queued and will be created in the background. Please check the stock entry after some time."
+					),
+					indicator="orange",
+					alert=True,
+				)
+
+			else:
+				self.set_opening_stock()
 
 	def validate(self):
 		if not self.item_name:
 			self.item_name = self.item_code
-
-		if not strip_html(cstr(self.description)).strip():
-			self.description = self.item_name
 
 		self.validate_uom()
 		self.validate_description()
@@ -230,7 +245,24 @@ class Item(Document):
 			cint(frappe.get_single_value("Stock Settings", "clean_description_html"))
 			and self.description != self.item_name  # perf: Avoid cleaning up a fallback
 		):
+			old_desc = self.description
 			self.description = clean_html(self.description)
+
+			if (
+				old_desc
+				and self.description
+				and "<img src" in old_desc
+				and "<img src" not in self.description
+			):
+				frappe.msgprint(
+					_(
+						'Image in the description has been removed. To disable this behavior, uncheck "{0}" in {1}.'
+					).format(
+						frappe.get_meta("Stock Settings").get_label("clean_description_html"),
+						get_link_to_form("Stock Settings"),
+					),
+					alert=True,
+				)
 
 	def validate_customer_provided_part(self):
 		if self.is_customer_provided_item:
@@ -262,7 +294,11 @@ class Item(Document):
 
 	def set_opening_stock(self):
 		"""set opening stock"""
-		if not self.is_stock_item or self.has_serial_no or self.has_batch_no:
+		if (
+			not self.is_stock_item
+			or (self.has_serial_no and not self.serial_no_series)
+			or (self.has_batch_no and (not self.create_new_batch or not self.batch_number_series))
+		):
 			return
 
 		if not self.valuation_rate and not self.standard_rate and not self.is_customer_provided_item:
@@ -310,8 +346,7 @@ class Item(Document):
 				frappe.throw(_("Cannot be a fixed asset item as Stock Ledger is created."))
 
 		if not self.is_fixed_asset and not self.is_new():
-			asset = frappe.db.get_all("Asset", filters={"item_code": self.name, "docstatus": 1}, limit=1)
-			if asset:
+			if self.has_submitted_assets():
 				frappe.throw(
 					_('"Is Fixed Asset" cannot be unchecked, as Asset record exists against the item')
 				)
@@ -411,6 +446,24 @@ class Item(Document):
 					)
 				)
 
+			if self.is_new() and series:
+				obj = NamingSeries(series)
+				prefix = obj.get_prefix()
+				doctype = frappe.qb.DocType("Series")
+
+				query = frappe.qb.from_(doctype).select(doctype.name).where(doctype.name.like(f"{prefix}%"))
+
+				prefix_exists = query.run(as_dict=True)
+				if prefix_exists:
+					frappe.msgprint(
+						_(
+							"The {0} prefix '{1}' already exists. Please change the Serial No Series, otherwise you will get a Duplicate Entry error."
+						).format(bold(frappe.unscrub(field)), bold(prefix)),
+						title=_("Serial No Series Overlap"),
+						indicator="yellow",
+						alert=True,
+					)
+
 	def check_for_active_boms(self):
 		if self.default_bom:
 			bom_item = frappe.db.get_value("BOM", self.default_bom, "item")
@@ -465,7 +518,7 @@ class Item(Document):
 					)
 					if item_barcode.barcode_type:
 						barcode_type = convert_erpnext_to_barcodenumber(
-							item_barcode.barcode_type.upper(), item_barcode.barcode
+							item_barcode.barcode_type.replace("-", "").upper(), item_barcode.barcode
 						)
 						if barcode_type in barcodenumber.barcodes():
 							if not barcodenumber.check_code(barcode_type, item_barcode.barcode):
@@ -526,6 +579,9 @@ class Item(Document):
 			)
 		return self._stock_ledger_created
 
+	def has_submitted_assets(self):
+		return bool(frappe.db.exists("Asset", {"item_code": self.name, "docstatus": 1}))
+
 	def update_item_price(self):
 		if self.is_new():
 			return
@@ -577,25 +633,6 @@ class Item(Document):
 			self.set_last_purchase_rate(new_name)
 			self.recalculate_bin_qty(new_name)
 
-		for dt in ("Sales Taxes and Charges", "Purchase Taxes and Charges"):
-			for d in frappe.db.sql(
-				f"""select name, item_wise_tax_detail from `tab{dt}`
-					where ifnull(item_wise_tax_detail, '') != ''""",
-				as_dict=1,
-			):
-				item_wise_tax_detail = json.loads(d.item_wise_tax_detail)
-				if isinstance(item_wise_tax_detail, dict) and old_name in item_wise_tax_detail:
-					item_wise_tax_detail[new_name] = item_wise_tax_detail[old_name]
-					item_wise_tax_detail.pop(old_name)
-
-					frappe.db.set_value(
-						dt,
-						d.name,
-						"item_wise_tax_detail",
-						json.dumps(item_wise_tax_detail),
-						update_modified=False,
-					)
-
 	def delete_old_bins(self, old_name):
 		frappe.db.delete("Bin", {"item_code": old_name})
 
@@ -638,7 +675,7 @@ class Item(Document):
 
 		if new_properties != [cstr(self.get(field)) for field in field_list]:
 			msg = _("To merge, following properties must be same for both items")
-			msg += ": \n" + ", ".join([self.meta.get_label(fld) for fld in field_list])
+			msg += ": \n" + ", ".join([_(self.meta.get_label(fld)) for fld in field_list])
 			frappe.throw(msg, title=_("Cannot Merge"), exc=DataValidationError)
 
 	def validate_duplicate_product_bundles_before_merge(self, old_name, new_name):
@@ -954,7 +991,12 @@ class Item(Document):
 		if self.is_new():
 			return
 
-		restricted_fields = ("has_serial_no", "is_stock_item", "valuation_method", "has_batch_no")
+		restricted_fields = (
+			"has_serial_no",
+			"is_stock_item",
+			"valuation_method",
+			"has_batch_no",
+		)
 
 		values = frappe.db.get_value("Item", self.name, restricted_fields, as_dict=True)
 		if not values:
@@ -977,7 +1019,7 @@ class Item(Document):
 			return
 
 		if linked_doc := self._get_linked_submitted_documents(changed_fields):
-			changed_field_labels = [frappe.bold(self.meta.get_label(f)) for f in changed_fields]
+			changed_field_labels = [frappe.bold(_(self.meta.get_label(f))) for f in changed_fields]
 			msg = _(
 				"As there are existing submitted transactions against item {0}, you can not change the value of {1}."
 			).format(self.name, ", ".join(changed_field_labels))
@@ -1277,7 +1319,7 @@ def get_item_defaults(item_code, company):
 
 	for d in item.item_defaults:
 		if d.company == company:
-			row = copy.deepcopy(d.as_dict())
+			row = d.as_dict(no_private_properties=True)
 			row.pop("name")
 			out.update(row)
 	return out
@@ -1299,7 +1341,7 @@ def set_item_default(item_code, company, fieldname, value):
 
 
 @frappe.whitelist()
-def get_item_details(item_code, company=None):
+def get_item_details(item_code: str, company: str | None = None):
 	out = frappe._dict()
 	if company:
 		out = get_item_defaults(item_code, company) or frappe._dict()
@@ -1311,7 +1353,7 @@ def get_item_details(item_code, company=None):
 
 
 @frappe.whitelist()
-def get_uom_conv_factor(uom, stock_uom):
+def get_uom_conv_factor(uom: str | None, stock_uom: str | None):
 	"""Get UOM conversion factor from uom to stock_uom
 	e.g. uom = "Kg", stock_uom = "Gram" then returns 1000.0
 	"""
@@ -1357,7 +1399,7 @@ def get_uom_conv_factor(uom, stock_uom):
 
 
 @frappe.whitelist()
-def get_item_attribute(parent, attribute_value=""):
+def get_item_attribute(parent: str, attribute_value: str = ""):
 	"""Used for providing auto-completions in child table."""
 	if not frappe.has_permission("Item"):
 		frappe.throw(_("No Permission"))

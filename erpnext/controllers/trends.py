@@ -4,7 +4,7 @@
 
 import frappe
 from frappe import _
-from frappe.utils import getdate
+from frappe.utils import DateTimeLikeObject, getdate
 
 
 def get_columns(filters, trans):
@@ -47,7 +47,7 @@ def get_columns(filters, trans):
 def validate_filters(filters):
 	for f in ["Fiscal Year", "Based On", "Period", "Company"]:
 		if not filters.get(f.lower().replace(" ", "_")):
-			frappe.throw(_("{0} is mandatory").format(f))
+			frappe.throw(_("{0} is mandatory").format(_(f)))
 
 	if not frappe.db.exists("Fiscal Year", filters.get("fiscal_year")):
 		frappe.throw(_("Fiscal Year {0} Does Not Exist").format(filters.get("fiscal_year")))
@@ -191,6 +191,9 @@ def get_data(filters, conditions):
 					des[j + inc] = row1[0][j]
 
 				data.append(des)
+
+		total_row = calculate_total_row(data1, conditions["columns"])
+		data.append(total_row)
 	else:
 		data = frappe.db.sql(
 			""" select {} from `tab{}` t1, `tab{} Item` t2 {}
@@ -214,7 +217,30 @@ def get_data(filters, conditions):
 			as_list=1,
 		)
 
+		total_row = calculate_total_row(data, conditions["columns"])
+		data.append(total_row)
+
 	return data
+
+
+def calculate_total_row(data, columns):
+	def wrap_in_quotes(label):
+		return f"'{label}'"
+
+	total_values = {}
+	for i, col in enumerate(columns):
+		if "Float" in col or "Currency/currency" in col:
+			total_values[i] = 0
+
+	for row in data:
+		for i in total_values.keys():
+			total_values[i] += row[i] if row[i] is not None else 0
+
+	total_row = [wrap_in_quotes(_("Total"))]
+	for i in range(1, len(columns)):
+		total_row.append(total_values.get(i, None))
+
+	return total_row
 
 
 def get_mon(dt):
@@ -277,8 +303,10 @@ def get_period_wise_query(bet_dates, trans_date, query_details):
 	return query_details
 
 
-@frappe.whitelist(allow_guest=True)
-def get_period_date_ranges(period, fiscal_year=None, year_start_date=None):
+@frappe.whitelist()
+def get_period_date_ranges(
+	period: str, fiscal_year: str | None = None, year_start_date: DateTimeLikeObject | None = None
+):
 	from dateutil.relativedelta import relativedelta
 
 	if not year_start_date:

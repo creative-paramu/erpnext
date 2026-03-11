@@ -7,6 +7,7 @@
 import json
 
 import frappe
+import frappe.defaults
 from frappe.model.document import Document
 from frappe.utils import flt
 
@@ -26,6 +27,7 @@ class PackedItem(Document):
 		actual_qty: DF.Float
 		batch_no: DF.Link | None
 		conversion_factor: DF.Float
+		delivered_by_supplier: DF.Check
 		description: DF.TextEditor | None
 		incoming_rate: DF.Currency
 		item_code: DF.Link | None
@@ -65,6 +67,10 @@ class PackedItem(Document):
 
 def make_packing_list(doc):
 	"Make/Update packing list for Product Bundle Item."
+
+	if doc.get("is_subcontracted"):
+		return
+
 	if doc.get("_action") and doc._action == "update_after_submit":
 		return
 
@@ -115,7 +121,12 @@ def get_indexed_packed_items_table(doc):
 	"""
 	indexed_table = {}
 	for packed_item in doc.get("packed_items"):
-		key = (packed_item.parent_item, packed_item.item_code, packed_item.parent_detail_docname)
+		key = (
+			packed_item.parent_item,
+			packed_item.item_code,
+			packed_item.idx if doc.is_new() else packed_item.parent_detail_docname,
+		)
+
 		indexed_table[key] = packed_item
 
 	return indexed_table
@@ -176,7 +187,11 @@ def add_packed_item_row(doc, packing_item, main_item_row, packed_items_table, re
 	exists, pi_row = False, {}
 
 	# check if row already exists in packed items table
-	key = (main_item_row.item_code, packing_item.item_code, main_item_row.name)
+	key = (
+		main_item_row.item_code,
+		packing_item.item_code,
+		main_item_row.idx if doc.is_new() else main_item_row.name,
+	)
 	if packed_items_table.get(key):
 		pi_row, exists = packed_items_table.get(key), True
 
@@ -217,6 +232,7 @@ def update_packed_item_basic_data(main_item_row, pi_row, packing_item, item_data
 	pi_row.uom = item_data.stock_uom
 	pi_row.qty = flt(packing_item.qty) * flt(main_item_row.stock_qty)
 	pi_row.conversion_factor = main_item_row.conversion_factor
+	pi_row.delivered_by_supplier = main_item_row.get("delivered_by_supplier")
 
 	if not pi_row.description:
 		pi_row.description = packing_item.get("description")
@@ -293,9 +309,9 @@ def update_packed_item_from_cancelled_doc(main_item_row, packing_item, pi_row, d
 		prev_doc_packed_items_map = get_cancelled_doc_packed_item_details(doc.packed_items)
 
 	if prev_doc_packed_items_map and prev_doc_packed_items_map.get(
-		(packing_item.item_code, main_item_row.item_code)
+		(packing_item.item_code, main_item_row.name)
 	):
-		prev_doc_row = prev_doc_packed_items_map.get((packing_item.item_code, main_item_row.item_code))
+		prev_doc_row = prev_doc_packed_items_map.get((packing_item.item_code, main_item_row.name))
 		pi_row.batch_no = prev_doc_row[0].batch_no
 		pi_row.serial_no = prev_doc_row[0].serial_no
 		pi_row.warehouse = prev_doc_row[0].warehouse
@@ -315,7 +331,9 @@ def get_packed_item_bin_qty(item, warehouse):
 def get_cancelled_doc_packed_item_details(old_packed_items):
 	prev_doc_packed_items_map = {}
 	for items in old_packed_items:
-		prev_doc_packed_items_map.setdefault((items.item_code, items.parent_item), []).append(items.as_dict())
+		prev_doc_packed_items_map.setdefault((items.item_code, items.parent_detail_docname), []).append(
+			items.as_dict()
+		)
 	return prev_doc_packed_items_map
 
 
@@ -323,7 +341,7 @@ def update_product_bundle_rate(parent_items_price, pi_row, item_row):
 	"""
 	Update the price dict of Product Bundles based on the rates of the Items in the bundle.
 
-	Stucture:
+	Structure:
 	{(Bundle Item 1, ae56fgji): 150.0, (Bundle Item 2, bc78fkjo): 200.0}
 	"""
 	key = (pi_row.parent_item, pi_row.parent_detail_docname)
@@ -348,12 +366,19 @@ def on_doctype_update():
 
 
 @frappe.whitelist()
-def get_items_from_product_bundle(row):
+def get_items_from_product_bundle(row: str):
 	row, items = ItemDetailsCtx(json.loads(row)), []
 
 	bundled_items = get_product_bundle_items(row["item_code"])
 	for item in bundled_items:
-		row.update({"item_code": item.item_code, "qty": flt(row["quantity"]) * flt(item.qty)})
+		row.update(
+			{
+				"item_code": item.item_code,
+				"qty": flt(row["quantity"]) * flt(item.qty),
+				"conversion_rate": 1,
+				"currency": frappe.defaults.get_defaults().currency,
+			}
+		)
 		items.append(get_item_details(row))
 
 	return items

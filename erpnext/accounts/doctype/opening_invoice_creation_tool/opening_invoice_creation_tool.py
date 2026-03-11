@@ -71,8 +71,8 @@ class OpeningInvoiceCreationTool(Document):
 		max_count = {}
 		fields = [
 			"company",
-			"count(name) as total_invoices",
-			"sum(outstanding_amount) as outstanding_amount",
+			{"COUNT": "*", "as": "total_invoices"},
+			{"SUM": "outstanding_amount", "as": "outstanding_amount"},
 		]
 		companies = frappe.get_all("Company", fields=["name as company", "default_currency as currency"])
 		if not companies:
@@ -214,6 +214,9 @@ class OpeningInvoiceCreationTool(Document):
 			}
 		)
 
+		if self.invoice_type == "Purchase" and row.supplier_invoice_date:
+			invoice.update({"bill_date": row.supplier_invoice_date})
+
 		accounting_dimension = get_accounting_dimensions()
 		for dimension in accounting_dimension:
 			invoice.update({dimension: self.get(dimension) or item.get(dimension)})
@@ -290,7 +293,7 @@ def publish(index, total, doctype):
 
 
 @frappe.whitelist()
-def get_temporary_opening_account(company=None):
+def get_temporary_opening_account(company: str | None = None):
 	if not company:
 		return
 

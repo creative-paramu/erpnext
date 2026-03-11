@@ -284,6 +284,9 @@ erpnext.crm.Opportunity = class Opportunity extends frappe.ui.form.Controller {
 			this.frm.set_value("currency", frappe.defaults.get_user_default("Currency"));
 		}
 
+		if (this.frm.is_new() && this.frm.doc.opportunity_type === undefined) {
+			this.frm.doc.opportunity_type = __("Sales");
+		}
 		this.setup_queries();
 	}
 
@@ -301,6 +304,21 @@ erpnext.crm.Opportunity = class Opportunity extends frappe.ui.form.Controller {
 			return {
 				query: "erpnext.controllers.queries.item_query",
 				filters: { is_sales_item: 1 },
+			};
+		});
+
+		this.frm.set_query("uom", "items", function (doc, cdt, cdn) {
+			let row = locals[cdt][cdn];
+
+			if (!row.item_code) {
+				return;
+			}
+
+			return {
+				query: "erpnext.controllers.queries.get_item_uom_query",
+				filters: {
+					item_code: row.item_code,
+				},
 			};
 		});
 

@@ -2,17 +2,17 @@
 # License: GNU General Public License v3. See license.txt
 
 
+import datetime
 import json
 
 import frappe
 from frappe import _
-from frappe.query_builder.functions import CombineDatetime, IfNull, Sum
+from frappe.query_builder.functions import IfNull, Sum
 from frappe.utils import cstr, flt, get_link_to_form, get_time, getdate, nowdate, nowtime
+from frappe.utils.data import DateTimeLikeObject
 
 import erpnext
-from erpnext.stock.doctype.serial_and_batch_bundle.serial_and_batch_bundle import (
-	get_available_serial_nos,
-)
+from erpnext.stock.doctype.serial_and_batch_bundle.serial_and_batch_bundle import get_available_serial_nos
 from erpnext.stock.doctype.warehouse.warehouse import get_child_warehouses
 from erpnext.stock.serial_batch_bundle import BatchNoValuation, SerialNoValuation
 from erpnext.stock.valuation import FIFOValuation, LIFOValuation
@@ -95,13 +95,13 @@ def get_stock_value_on(
 
 @frappe.whitelist()
 def get_stock_balance(
-	item_code,
-	warehouse,
-	posting_date=None,
-	posting_time=None,
-	with_valuation_rate=False,
-	with_serial_no=False,
-	inventory_dimensions_dict=None,
+	item_code: str,
+	warehouse: str,
+	posting_date: DateTimeLikeObject | None = None,
+	posting_time: DateTimeLikeObject | datetime.timedelta | None = None,
+	with_valuation_rate: bool = False,
+	with_serial_no: bool = False,
+	inventory_dimensions_dict: dict | None = None,
 ):
 	"""Returns stock balance quantity at given warehouse on given posting date or current date.
 
@@ -126,8 +126,9 @@ def get_stock_balance(
 	extra_cond = ""
 	if inventory_dimensions_dict:
 		for field, value in inventory_dimensions_dict.items():
+			column = frappe.utils.sanitize_column(field)
 			args[field] = value
-			extra_cond += f" and {field} = %({field})s"
+			extra_cond += f" and {column} = %({field})s"
 
 	last_entry = get_previous_sle(args, extra_cond=extra_cond)
 
@@ -138,8 +139,7 @@ def get_stock_balance(
 					{
 						"item_code": item_code,
 						"warehouse": warehouse,
-						"posting_date": posting_date,
-						"posting_time": posting_time,
+						"posting_datetime": get_combine_datetime(posting_date, posting_time),
 						"ignore_warehouse": 1,
 					}
 				)
@@ -167,7 +167,7 @@ def get_serial_nos_data(serial_nos):
 
 
 @frappe.whitelist()
-def get_latest_stock_qty(item_code, warehouse=None):
+def get_latest_stock_qty(item_code: str, warehouse: str | None = None):
 	values, condition = [item_code], ""
 	if warehouse:
 		lft, rgt, is_group = frappe.db.get_value("Warehouse", warehouse, ["lft", "rgt", "is_group"])
@@ -239,12 +239,15 @@ def _create_bin(item_code, warehouse):
 
 
 @frappe.whitelist()
-def get_incoming_rate(args, raise_error_if_no_rate=True):
+def get_incoming_rate(args: dict | str, raise_error_if_no_rate: bool = True, fallbacks: bool = True):
 	"""Get Incoming Rate based on valuation method"""
 	from erpnext.stock.stock_ledger import get_previous_sle, get_valuation_rate
 
 	if isinstance(args, str):
 		args = json.loads(args)
+
+	if not args.get("posting_datetime") and args.get("posting_date"):
+		args["posting_datetime"] = get_combine_datetime(args.get("posting_date"), args.get("posting_time"))
 
 	in_rate = None
 
@@ -301,7 +304,7 @@ def get_incoming_rate(args, raise_error_if_no_rate=True):
 
 		return batch_obj.get_incoming_rate()
 	else:
-		valuation_method = get_valuation_method(args.get("item_code"))
+		valuation_method = get_valuation_method(args.get("item_code"), args.get("company"))
 		previous_sle = get_previous_sle(args)
 		if valuation_method in ("FIFO", "LIFO"):
 			if previous_sle:
@@ -324,38 +327,11 @@ def get_incoming_rate(args, raise_error_if_no_rate=True):
 			args.get("allow_zero_valuation"),
 			currency=erpnext.get_company_currency(args.get("company")),
 			company=args.get("company"),
+			fallbacks=fallbacks,
 			raise_error_if_no_rate=raise_error_if_no_rate,
 		)
 
 	return flt(in_rate)
-
-
-def get_batch_incoming_rate(item_code, warehouse, batch_no, posting_date, posting_time, creation=None):
-	sle = frappe.qb.DocType("Stock Ledger Entry")
-
-	timestamp_condition = CombineDatetime(sle.posting_date, sle.posting_time) < CombineDatetime(
-		posting_date, posting_time
-	)
-	if creation:
-		timestamp_condition |= (
-			CombineDatetime(sle.posting_date, sle.posting_time) == CombineDatetime(posting_date, posting_time)
-		) & (sle.creation < creation)
-
-	batch_details = (
-		frappe.qb.from_(sle)
-		.select(Sum(sle.stock_value_difference).as_("batch_value"), Sum(sle.actual_qty).as_("batch_qty"))
-		.where(
-			(sle.item_code == item_code)
-			& (sle.warehouse == warehouse)
-			& (sle.batch_no == batch_no)
-			& (sle.serial_and_batch_bundle.isnull())
-			& (sle.is_cancelled == 0)
-		)
-		.where(timestamp_condition)
-	).run(as_dict=True)
-
-	if batch_details and batch_details[0].batch_qty:
-		return batch_details[0].batch_value / batch_details[0].batch_qty
 
 
 def get_avg_purchase_rate(serial_nos):
@@ -372,11 +348,16 @@ def get_avg_purchase_rate(serial_nos):
 	)
 
 
-def get_valuation_method(item_code):
+@frappe.request_cache
+def get_valuation_method(item_code, company=None):
 	"""get valuation method from item or default"""
 	val_method = frappe.get_cached_value("Item", item_code, "valuation_method")
 	if not val_method:
-		val_method = frappe.get_cached_doc("Stock Settings").valuation_method or "FIFO"
+		val_method = (
+			frappe.get_cached_value("Company", company, "valuation_method")
+			if company
+			else frappe.get_single_value("Stock Settings", "valuation_method") or "FIFO"
+		)
 	return val_method
 
 
@@ -554,7 +535,7 @@ def is_reposting_item_valuation_in_progress():
 		)
 
 
-def check_pending_reposting(posting_date: str, throw_error: bool = True) -> bool:
+def check_pending_reposting(posting_date: str, company: str | None = None, throw_error: bool = True) -> bool:
 	"""Check if there are pending reposting job till the specified posting date."""
 
 	filters = {
@@ -562,6 +543,8 @@ def check_pending_reposting(posting_date: str, throw_error: bool = True) -> bool
 		"status": ["in", ["Queued", "In Progress"]],
 		"posting_date": ["<=", posting_date],
 	}
+	if company:
+		filters["company"] = company
 
 	reposting_pending = frappe.db.exists("Repost Item Valuation", filters)
 	if reposting_pending and throw_error:
@@ -584,13 +567,21 @@ def check_pending_reposting(posting_date: str, throw_error: bool = True) -> bool
 
 
 @frappe.whitelist()
-def scan_barcode(search_value: str) -> BarcodeScanResult:
+def scan_barcode(search_value: str, ctx: dict | str | None = None) -> BarcodeScanResult:
 	def set_cache(data: BarcodeScanResult):
 		frappe.cache().set_value(f"erpnext:barcode_scan:{search_value}", data, expires_in_sec=120)
+		_update_item_info(data, ctx)
 
 	def get_cache() -> BarcodeScanResult | None:
-		if data := frappe.cache().get_value(f"erpnext:barcode_scan:{search_value}"):
-			return data
+		data = frappe.cache().get_value(f"erpnext:barcode_scan:{search_value}")
+		if not data:
+			return
+
+		_update_item_info(data, ctx)
+		return data
+
+	if ctx is None:
+		ctx = frappe._dict()
 
 	if scan_data := get_cache():
 		return scan_data
@@ -603,7 +594,6 @@ def scan_barcode(search_value: str) -> BarcodeScanResult:
 		as_dict=True,
 	)
 	if barcode_data:
-		_update_item_info(barcode_data)
 		set_cache(barcode_data)
 		return barcode_data
 
@@ -615,7 +605,6 @@ def scan_barcode(search_value: str) -> BarcodeScanResult:
 		as_dict=True,
 	)
 	if serial_no_data:
-		_update_item_info(serial_no_data)
 		set_cache(serial_no_data)
 		return serial_no_data
 
@@ -634,22 +623,38 @@ def scan_barcode(search_value: str) -> BarcodeScanResult:
 				).format(search_value, batch_no_data.item_code)
 			)
 
-		_update_item_info(batch_no_data)
 		set_cache(batch_no_data)
 		return batch_no_data
+
+	warehouse = frappe.get_cached_value("Warehouse", search_value, ("name", "disabled"), as_dict=True)
+	if warehouse and not warehouse.disabled:
+		warehouse_data = {"warehouse": warehouse.name}
+		set_cache(warehouse_data)
+		return warehouse_data
 
 	return {}
 
 
-def _update_item_info(scan_result: dict[str, str | None]) -> dict[str, str | None]:
-	if item_code := scan_result.get("item_code"):
-		if item_info := frappe.get_cached_value(
-			"Item",
-			item_code,
-			["has_batch_no", "has_serial_no"],
-			as_dict=True,
-		):
-			scan_result.update(item_info)
+def _update_item_info(scan_result: dict[str, str | None], ctx: dict | None = None) -> dict[str, str | None]:
+	from erpnext.stock.get_item_details import get_item_warehouse_
+
+	item_code = scan_result.get("item_code")
+	if not item_code:
+		return scan_result
+
+	if item_info := frappe.get_cached_value(
+		"Item",
+		item_code,
+		("has_batch_no", "has_serial_no"),
+		as_dict=True,
+	):
+		scan_result.update(item_info)
+
+	if ctx and (
+		warehouse := get_item_warehouse_(ctx, frappe._dict(name=item_code), overwrite_warehouse=True)
+	):
+		scan_result["default_warehouse"] = warehouse
+
 	return scan_result
 
 

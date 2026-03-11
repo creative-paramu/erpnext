@@ -2,6 +2,8 @@
 # For license information, please see license.txt
 
 
+from typing import Any
+
 import frappe
 from frappe import _
 from frappe.model.document import Document
@@ -12,6 +14,10 @@ from frappe.utils import cint, flt
 import erpnext
 from erpnext.controllers.taxes_and_totals import init_landed_taxes_and_totals
 from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
+
+
+class IncorrectCompanyValidationError(frappe.ValidationError):
+	pass
 
 
 class LandedCostVoucher(Document):
@@ -30,6 +36,9 @@ class LandedCostVoucher(Document):
 		from erpnext.stock.doctype.landed_cost_taxes_and_charges.landed_cost_taxes_and_charges import (
 			LandedCostTaxesandCharges,
 		)
+		from erpnext.stock.doctype.landed_cost_vendor_invoice.landed_cost_vendor_invoice import (
+			LandedCostVendorInvoice,
+		)
 
 		amended_from: DF.Link | None
 		company: DF.Link
@@ -40,6 +49,8 @@ class LandedCostVoucher(Document):
 		purchase_receipts: DF.Table[LandedCostPurchaseReceipt]
 		taxes: DF.Table[LandedCostTaxesandCharges]
 		total_taxes_and_charges: DF.Currency
+		total_vendor_invoices_cost: DF.Currency
+		vendor_invoices: DF.Table[LandedCostVendorInvoice]
 	# end: auto-generated types
 
 	@frappe.whitelist()
@@ -70,12 +81,19 @@ class LandedCostVoucher(Document):
 		self.check_mandatory()
 		self.validate_receipt_documents()
 		self.validate_line_items()
+		self.validate_expense_accounts()
 		init_landed_taxes_and_totals(self)
 		self.set_total_taxes_and_charges()
 		if not self.get("items"):
 			self.get_items_from_purchase_receipts()
 
 		self.set_applicable_charges_on_item()
+		self.set_total_vendor_invoices_cost()
+
+	def set_total_vendor_invoices_cost(self):
+		self.total_vendor_invoices_cost = 0.0
+		for row in self.vendor_invoices:
+			self.total_vendor_invoices_cost += flt(row.amount)
 
 	def validate_line_items(self):
 		for d in self.get("items"):
@@ -105,10 +123,27 @@ class LandedCostVoucher(Document):
 		receipt_documents = []
 
 		for d in self.get("purchase_receipts"):
-			docstatus = frappe.db.get_value(d.receipt_document_type, d.receipt_document, "docstatus")
+			docstatus, company = frappe.get_cached_value(
+				d.receipt_document_type, d.receipt_document, ["docstatus", "company"]
+			)
 			if docstatus != 1:
 				msg = f"Row {d.idx}: {d.receipt_document_type} {frappe.bold(d.receipt_document)} must be submitted"
 				frappe.throw(_(msg), title=_("Invalid Document"))
+
+			if company != self.company:
+				frappe.throw(
+					_(
+						"Row {0}: {1} {2} is linked to company {3}. Please select a document belonging to company {4}."
+					).format(
+						d.idx,
+						d.receipt_document_type,
+						frappe.bold(d.receipt_document),
+						frappe.bold(company),
+						frappe.bold(self.company),
+					),
+					title=_("Incorrect Company"),
+					exc=IncorrectCompanyValidationError,
+				)
 
 			if d.receipt_document_type == "Purchase Invoice":
 				update_stock = frappe.db.get_value(
@@ -139,6 +174,24 @@ class LandedCostVoucher(Document):
 			if not item.cost_center:
 				frappe.throw(
 					_("Row {0}: Cost center is required for an item {1}").format(item.idx, item.item_code)
+				)
+
+	def validate_expense_accounts(self):
+		for t in self.taxes:
+			company = frappe.get_cached_value("Account", t.expense_account, "company")
+
+			if company != self.company:
+				frappe.throw(
+					_(
+						"Row {0}: Expense Account {1} is linked to company {2}. Please select an account belonging to company {3}."
+					).format(
+						t.idx,
+						frappe.bold(t.expense_account),
+						frappe.bold(company),
+						frappe.bold(self.company),
+					),
+					title=_("Incorrect Account"),
+					exc=IncorrectCompanyValidationError,
 				)
 
 	def set_total_taxes_and_charges(self):
@@ -210,7 +263,7 @@ class LandedCostVoucher(Document):
 			)
 
 	@frappe.whitelist()
-	def get_receipt_document_details(self, receipt_document_type, receipt_document):
+	def get_receipt_document_details(self, receipt_document_type: str, receipt_document: str):
 		if receipt_document_type in [
 			"Purchase Invoice",
 			"Purchase Receipt",
@@ -234,9 +287,20 @@ class LandedCostVoucher(Document):
 	def on_submit(self):
 		self.validate_applicable_charges_for_item()
 		self.update_landed_cost()
+		self.update_claimed_landed_cost()
 
 	def on_cancel(self):
 		self.update_landed_cost()
+		self.update_claimed_landed_cost()
+
+	def update_claimed_landed_cost(self):
+		for row in self.vendor_invoices:
+			frappe.db.set_value(
+				"Purchase Invoice",
+				row.vendor_invoice,
+				"claimed_landed_cost_amount",
+				flt(row.amount, row.precision("amount")) if self.docstatus == 1 else 0.0,
+			)
 
 	def update_landed_cost(self):
 		for d in self.get("purchase_receipts"):
@@ -333,6 +397,24 @@ class LandedCostVoucher(Document):
 						tuple([item.valuation_rate, *serial_nos]),
 					)
 
+	@frappe.whitelist()
+	def get_vendor_invoice_amount(self, vendor_invoice: str):
+		filters = frappe._dict(
+			{
+				"name": vendor_invoice,
+				"company": self.company,
+			}
+		)
+
+		query = get_vendor_invoice_query(filters)
+
+		result = query.run(as_dict=True)
+		amount = result[0].unclaimed_amount if result else 0.0
+
+		return {
+			"amount": amount,
+		}
+
 
 def get_pr_items(purchase_receipt):
 	item = frappe.qb.DocType("Item")
@@ -359,6 +441,7 @@ def get_pr_items(purchase_receipt):
 			(pr_item.parent == purchase_receipt.receipt_document)
 			& ((item.is_stock_item == 1) | (item.is_fixed_asset == 1))
 		)
+		.orderby(pr_item.idx)
 	)
 
 	if purchase_receipt.receipt_document_type == "Subcontracting Receipt":
@@ -382,3 +465,57 @@ def get_pr_items(purchase_receipt):
 		)
 
 	return query.run(as_dict=True)
+
+
+@frappe.whitelist()
+@frappe.validate_and_sanitize_search_inputs
+def get_vendor_invoices(
+	doctype: str, txt: str | None, searchfield: Any, start: int, page_len: int, filters: dict
+):
+	if not frappe.has_permission("Purchase Invoice", "read"):
+		return []
+
+	if txt and txt.lower().startswith(("select", "delete", "update")):
+		frappe.throw(_("Invalid search query"), title=_("Invalid Query"))
+
+	query = get_vendor_invoice_query(filters)
+
+	if txt:
+		query = query.where(frappe.qb.DocType(doctype).name.like(f"%{txt}%"))
+
+	if start:
+		query = query.limit(page_len).offset(start)
+
+	return query.run(as_list=True)
+
+
+def get_vendor_invoice_query(filters):
+	doctype = frappe.qb.DocType("Purchase Invoice")
+	child_doctype = frappe.qb.DocType("Purchase Invoice Item")
+	item = frappe.qb.DocType("Item")
+
+	query = (
+		frappe.qb.from_(doctype)
+		.inner_join(child_doctype)
+		.on(child_doctype.parent == doctype.name)
+		.inner_join(item)
+		.on(item.name == child_doctype.item_code)
+		.select(
+			doctype.name,
+			(doctype.base_total - doctype.claimed_landed_cost_amount).as_("unclaimed_amount"),
+		)
+		.where(
+			(doctype.docstatus == 1)
+			& (doctype.is_subcontracted == 0)
+			& (doctype.is_return == 0)
+			& (doctype.update_stock == 0)
+			& (doctype.company == filters.get("company"))
+			& (item.is_stock_item == 0)
+		)
+		.having(frappe.qb.Field("unclaimed_amount") > 0)
+	)
+
+	if filters.get("name"):
+		query = query.where(doctype.name == filters.get("name"))
+
+	return query

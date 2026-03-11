@@ -6,7 +6,6 @@ from frappe.model.naming import set_name_by_naming_series
 from frappe.permissions import (
 	add_user_permission,
 	get_doc_permissions,
-	has_permission,
 	remove_user_permission,
 )
 from frappe.utils import cstr, getdate, today, validate_email_address
@@ -184,13 +183,11 @@ class Employee(NestedSet):
 				throw(_("Please enter relieving date."))
 
 	def validate_for_enabled_user_id(self, enabled):
-		if self.status != "Active":
-			return
-
 		if enabled is None:
 			frappe.throw(_("User {0} does not exist").format(self.user_id))
-		if enabled == 0:
-			frappe.throw(_("User {0} is disabled").format(self.user_id), EmployeeUserDisabledError)
+
+		if self.status != "Active" and enabled or self.status == "Active" and enabled == 0:
+			frappe.set_value("User", self.user_id, "enabled", not enabled)
 
 	def validate_duplicate_user_id(self):
 		Employee = frappe.qb.DocType("Employee")
@@ -254,7 +251,11 @@ def get_employee_email(employee_doc):
 	)
 
 
-def get_holiday_list_for_employee(employee, raise_exception=True):
+def get_holiday_list_for_employee(employee, raise_exception=True, as_on=None):
+	hrms_override = frappe.get_hooks("employee_holiday_list")
+
+	if hrms_override:
+		return frappe.get_attr(hrms_override[-1])(employee, raise_exception, as_on)
 	if employee:
 		holiday_list, company = frappe.get_cached_value("Employee", employee, ["holiday_list", "company"])
 	else:
@@ -301,7 +302,7 @@ def is_holiday(employee, date=None, raise_exception=True, only_non_weekly=False,
 
 
 @frappe.whitelist()
-def deactivate_sales_person(status=None, employee=None):
+def deactivate_sales_person(status: str | None = None, employee: str | None = None):
 	if status == "Left":
 		sales_person = frappe.db.get_value("Sales Person", {"Employee": employee})
 		if sales_person:
@@ -309,7 +310,7 @@ def deactivate_sales_person(status=None, employee=None):
 
 
 @frappe.whitelist()
-def create_user(employee, user=None, email=None):
+def create_user(employee: str, email: str | None = None):
 	emp = frappe.get_doc("Employee", employee)
 
 	employee_name = emp.employee_name.split(" ")
@@ -381,7 +382,13 @@ def get_employee_emails(employee_list):
 
 
 @frappe.whitelist()
-def get_children(doctype, parent=None, company=None, is_root=False, is_tree=False):
+def get_children(
+	doctype: str,
+	parent: str | None = None,
+	company: str | None = None,
+	is_root: bool = False,
+	is_tree: bool = False,
+):
 	filters = [["status", "=", "Active"]]
 	if company and company != "All Companies":
 		filters.append(["company", "=", company])
@@ -425,3 +432,59 @@ def has_upload_permission(doc, ptype="read", user=None):
 	if get_doc_permissions(doc, user=user, ptype=ptype).get(ptype):
 		return True
 	return doc.user_id == user
+
+
+@frappe.whitelist()
+def get_contact_details(employee: str) -> dict:
+	"""
+	Returns basic contact details for the given employee.
+
+	Email is selected based on the following priority:
+	1. Prefered Email
+	2. Company Email
+	3. Personal Email
+	4. User ID
+	"""
+	if not employee:
+		frappe.throw(msg=_("Employee is required"), title=_("Missing Parameter"))
+
+	frappe.has_permission("Employee", "read", employee, throw=True)
+
+	return _get_contact_details(employee)
+
+
+def _get_contact_details(employee: str) -> dict:
+	contact_data = frappe.db.get_value(
+		"Employee",
+		employee,
+		[
+			"employee_name",
+			"prefered_email",
+			"company_email",
+			"personal_email",
+			"user_id",
+			"cell_number",
+			"designation",
+			"department",
+		],
+		as_dict=True,
+	)
+
+	if not contact_data:
+		frappe.throw(msg=_("Employee {0} not found").format(employee), title=_("Not Found"))
+
+	# Email with priority
+	employee_email = (
+		contact_data.get("prefered_email")
+		or contact_data.get("company_email")
+		or contact_data.get("personal_email")
+		or contact_data.get("user_id")
+	)
+
+	return {
+		"contact_display": contact_data.get("employee_name"),
+		"contact_email": employee_email,
+		"contact_mobile": contact_data.get("cell_number"),
+		"contact_designation": contact_data.get("designation"),
+		"contact_department": contact_data.get("department"),
+	}

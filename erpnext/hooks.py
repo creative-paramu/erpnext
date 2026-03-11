@@ -8,7 +8,7 @@ app_email = "hello@frappe.io"
 app_license = "GNU General Public License (v3)"
 source_link = "https://github.com/frappe/erpnext"
 app_logo_url = "/assets/erpnext/images/erpnext-logo.svg"
-app_home = "/app/home"
+app_home = "/desk"
 
 add_to_apps_screen = [
 	{
@@ -20,7 +20,7 @@ add_to_apps_screen = [
 	}
 ]
 
-develop_version = "15.x.x-develop"
+develop_version = "17.x.x-develop"
 
 app_include_js = "erpnext.bundle.js"
 app_include_css = "erpnext.bundle.css"
@@ -51,7 +51,9 @@ doctype_list_js = {
 	],
 }
 
-override_doctype_class = {"Address": "erpnext.accounts.custom.address.ERPNextAddress"}
+page_js = {"print": "public/js/print.js"}
+
+extend_doctype_class = {"Address": "erpnext.accounts.custom.address.ERPNextAddress"}
 
 override_whitelisted_methods = {"frappe.www.contact.send_message": "erpnext.templates.utils.send_message"}
 
@@ -152,6 +154,14 @@ website_route_rules = [
 			"parents": [{"label": "Purchase Order", "route": "purchase-orders"}],
 		},
 	},
+	{
+		"from_route": "/purchase-orders/<path:name>",
+		"to_route": "order",
+		"defaults": {
+			"doctype": "Purchase Order",
+			"parents": [{"label": "Purchase Order", "route": "purchase-orders"}],
+		},
+	},
 	{"from_route": "/purchase-invoices", "to_route": "Purchase Invoice"},
 	{
 		"from_route": "/purchase-invoices/<path:name>",
@@ -209,6 +219,16 @@ website_route_rules = [
 	{"from_route": "/tasks", "to_route": "Task"},
 ]
 
+standard_navbar_items = [
+	{
+		"item_label": "Clear Demo Data",
+		"item_type": "Action",
+		"action": "erpnext.demo.clear_demo();",
+		"is_standard": 1,
+		"condition": "eval: frappe.boot.sysdefaults.demo_company",
+	},
+]
+
 standard_portal_menu_items = [
 	{"title": "Projects", "route": "/project", "reference_doctype": "Project", "role": "Customer"},
 	{
@@ -260,7 +280,7 @@ standard_portal_menu_items = [
 		"role": "Customer",
 	},
 	{"title": "Issues", "route": "/issues", "reference_doctype": "Issue", "role": "Customer"},
-	{"title": "Addresses", "route": "/addresses", "reference_doctype": "Address"},
+	{"title": "Addresses", "route": "/addresses", "reference_doctype": "Address", "role": "Customer"},
 	{
 		"title": "Timesheets",
 		"route": "/timesheets",
@@ -280,6 +300,7 @@ standard_portal_menu_items = [
 sounds = [
 	{"name": "incoming-call", "src": "/assets/erpnext/sounds/incoming-call.mp3", "volume": 0.2},
 	{"name": "call-disconnect", "src": "/assets/erpnext/sounds/call-disconnect.mp3", "volume": 0.2},
+	{"name": "numpad-touch", "src": "/assets/erpnext/sounds/numpad-touch.mp3", "volume": 0.8},
 ]
 
 has_upload_permission = {"Employee": "erpnext.setup.doctype.employee.employee.has_upload_permission"}
@@ -356,10 +377,11 @@ doc_events = {
 	},
 	"Sales Invoice": {
 		"on_submit": [
-			"erpnext.regional.create_transaction_log",
 			"erpnext.regional.italy.utils.sales_invoice_on_submit",
 		],
-		"on_cancel": ["erpnext.regional.italy.utils.sales_invoice_on_cancel"],
+		"on_cancel": [
+			"erpnext.regional.italy.utils.sales_invoice_on_cancel",
+		],
 		"on_trash": "erpnext.regional.check_deletion_permission",
 	},
 	"Purchase Invoice": {
@@ -369,11 +391,6 @@ doc_events = {
 		]
 	},
 	"Payment Entry": {
-		"on_submit": [
-			"erpnext.regional.create_transaction_log",
-			"erpnext.accounts.doctype.dunning.dunning.resolve_dunning",
-		],
-		"on_cancel": ["erpnext.accounts.doctype.dunning.dunning.resolve_dunning"],
 		"on_trash": "erpnext.regional.check_deletion_permission",
 	},
 	"Address": {
@@ -395,9 +412,10 @@ doc_events = {
 }
 
 # function should expect the variable and doc as arguments
+naming_series_variables_list = ["FY", "TFY", "ABBR", "MM", "DD", "YY", "YYYY", "JJJ", "WW"]
 naming_series_variables = {
-	"FY": "erpnext.accounts.utils.parse_naming_series_variable",
-	"ABBR": "erpnext.accounts.utils.parse_naming_series_variable",
+	variable: "erpnext.accounts.utils.parse_naming_series_variable"
+	for variable in naming_series_variables_list
 }
 
 # On cancel event Payment Entry will be exempted and all linked submittable doctype will get cancelled.
@@ -412,7 +430,9 @@ scheduler_events = {
 		"0/15 * * * *": [
 			"erpnext.manufacturing.doctype.bom_update_log.bom_update_log.resume_bom_cost_update_jobs",
 		],
-		"0/30 * * * *": [],
+		"0/30 * * * *": [
+			"erpnext.stock.doctype.repost_item_valuation.repost_item_valuation.run_parallel_reposting",
+		],
 		# Hourly but offset by 30 minutes
 		"30 * * * *": [
 			"erpnext.accounts.doctype.gl_entry.gl_entry.rename_gle_sle_docs",
@@ -524,6 +544,7 @@ accounting_dimension_doctypes = [
 	"Purchase Order Item",
 	"Sales Order Item",
 	"Journal Entry Account",
+	"Journal Entry Template Account",
 	"Material Request Item",
 	"Delivery Note Item",
 	"Purchase Receipt Item",
@@ -560,6 +581,7 @@ accounting_dimension_doctypes = [
 	"Payment Request",
 	"Asset Movement Item",
 	"Asset Depreciation Schedule",
+	"Advance Taxes and Charges",
 ]
 
 get_matching_queries = (
@@ -602,6 +624,7 @@ user_privacy_documents = [
 		"personal_fields": ["contact_mobile", "contact_display", "customer_name"],
 	},
 ]
+
 
 # ERPNext doctypes for Global Search
 global_search_doctypes = {
@@ -647,6 +670,10 @@ global_search_doctypes = {
 	],
 }
 
+ignore_links_on_delete = [
+	"Tax Withholding Entry",
+]
+
 additional_timeline_content = {"*": ["erpnext.telephony.doctype.call_log.call_log.get_linked_call_logs"]}
 
 
@@ -663,3 +690,8 @@ default_log_clearing_doctypes = {
 export_python_type_annotations = True
 
 fields_for_group_similar_items = ["qty", "amount"]
+
+# Translation
+# ------------
+# List of apps whose translatable strings should be excluded from this app's translations.
+ignore_translatable_strings_from = ["frappe"]
